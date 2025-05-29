@@ -1,4 +1,3 @@
-
 import os
 import sys
 import argparse
@@ -25,7 +24,8 @@ import cfg
 from tqdm import tqdm
 from utils import *
 from einops import rearrange
-import models.sam.utils.transforms as samtrans
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'sam2')))
+import sam2.utils.transforms as samtrans
 
 import shutil
 import tempfile
@@ -43,7 +43,6 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer, sche
     hard = 0
     epoch_loss = 0
     ind = 0
-    # train mode
     net.train()
     optimizer.zero_grad()
 
@@ -70,38 +69,74 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer, sche
             b_size,c,w,h = imgs.size()
             longsize = w if w >=h else h
 
-            if point_labels[0] != -1:
-                # point_coords = samtrans.ResizeLongestSide(longsize).apply_coords(pt, (h, w))
-                point_coords = pt
-                coords_torch = torch.as_tensor(point_coords, dtype=torch.float).cuda()
-                labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+            if isinstance(pt, tuple) and len(pt) == 2:
+                coords_torch, labels_torch = pt
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+            else:
+                coords_torch = torch.as_tensor(pt, dtype=torch.float).cuda()
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+                elif 'point_labels' in locals():
+                    labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+                else:
+                    labels_torch = -torch.ones(coords_torch.shape[:-1], dtype=torch.int, device=coords_torch.device)
                 coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
-                pt = (coords_torch, labels_torch)
+            pt = (coords_torch, labels_torch)
 
-            '''init'''
             if hard:
                 true_mask_ave = (true_mask_ave > 0.5).float()
-                #true_mask_ave = cons_tensor(true_mask_ave)
             imgs = imgs.float().cuda()
             
-            '''Train'''
             for n, value in net.image_encoder.named_parameters():
                 if "Adapter" not in n:
                     value.requires_grad = False
 
-            imge = net.image_encoder(imgs)
+            encoder_output = net.image_encoder(imgs)
+            
+            if isinstance(encoder_output, dict) and "backbone_fpn" in encoder_output:
+                imge = encoder_output["backbone_fpn"][-1]
+            else:
+                imge = encoder_output
 
             with torch.no_grad():
-                # imge= net.image_encoder(imgs)
-                se, de = net.prompt_encoder(points=pt, boxes=None, masks=None, )
+                se, de = net.sam_prompt_encoder(points=pt, boxes=None, masks=None, )
                 
-            pred, _ = net.mask_decoder(
+            print("DEBUG: se shape:", se.shape if hasattr(se, 'shape') else type(se))
+            print("DEBUG: de shape:", de.shape if hasattr(de, 'shape') else type(de))
+            print("DEBUG: imge shape:", imge.shape if hasattr(imge, 'shape') else type(imge))
+
+            high_res_features = None
+            if hasattr(net, 'use_high_res_features_in_sam') and net.use_high_res_features_in_sam:
+                fpn = encoder_output["backbone_fpn"]
+                high_res_features = [
+                    net.sam_mask_decoder.conv_s0(fpn[0]),
+                    net.sam_mask_decoder.conv_s1(fpn[1]),
+                ]
+
+            if de is not None and hasattr(de, 'shape'):
+                if de.shape[-2:] != imge.shape[-2:]:
+                    de = F.interpolate(de, size=imge.shape[-2:], mode='bilinear', align_corners=False)
+                if de.shape[1] != imge.shape[1]:
+                    if not hasattr(net, 'de_proj') or net.de_proj is None or \
+                       net.de_proj.in_channels != de.shape[1] or net.de_proj.out_channels != imge.shape[1]:
+                        net.de_proj = nn.Conv2d(de.shape[1], imge.shape[1], kernel_size=1).to(de.device)
+                    de = net.de_proj(de)
+
+            pred, iou_pred, sam_tokens_out, object_score_logits = net.sam_mask_decoder(
                 image_embeddings=imge,
-                image_pe=net.prompt_encoder.get_dense_pe(), 
+                image_pe=net.sam_prompt_encoder.get_dense_pe(), 
                 sparse_prompt_embeddings=se,
                 dense_prompt_embeddings=de, 
                 multimask_output=False,
-              )
+                repeat_image=True,
+                high_res_features=high_res_features,
+            )
+
+            if pred.shape[-2:] != masks.shape[-2:]:
+                pred = F.interpolate(pred, size=masks.shape[-2:], mode='bilinear', align_corners=False)
 
             loss = lossfunc(pred, masks)
 
@@ -109,11 +144,9 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer, sche
             epoch_loss += loss.item()
             loss.backward()
 
-            # nn.utils.clip_grad_value_(net.parameters(), 0.1)
             optimizer.step()
             optimizer.zero_grad()
 
-            '''vis images'''
             if vis:
                 if ind % vis == 0:
                     namecat = 'Train'
@@ -126,11 +159,10 @@ def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer, sche
     return loss
 
 def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
-    # eval mode
     net.eval()
 
     mask_type = torch.float32
-    n_val = len(val_loader)  # the number of batch
+    n_val = len(val_loader)
     mix_res = (0,0,0,0)
     tot = 0
     threshold = (0.1, 0.3, 0.5, 0.7, 0.9)
@@ -155,30 +187,70 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
             showp = pt
             mask_type = torch.float32
 
-            if point_labels[0] != -1:
-                point_coords = pt
-                coords_torch = torch.as_tensor(point_coords, dtype=torch.float).cuda()
-                labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+            if isinstance(pt, tuple) and len(pt) == 2:
+                coords_torch, labels_torch = pt
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+            else:
+                coords_torch = torch.as_tensor(pt, dtype=torch.float).cuda()
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+                elif 'point_labels' in locals():
+                    labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+                else:
+                    labels_torch = -torch.ones(coords_torch.shape[:-1], dtype=torch.int, device=coords_torch.device)
                 coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
-                pt = (coords_torch, labels_torch)
+            pt = (coords_torch, labels_torch)
 
             imgs = imgs.to(dtype = mask_type).cuda()
-            '''val'''
             with torch.no_grad():
-                imge= net.image_encoder(imgs)
-                se, de = net.prompt_encoder(points=pt, boxes=None, masks=None)
+                encoder_output = net.image_encoder(imgs)
+                
+                if isinstance(encoder_output, dict) and "backbone_fpn" in encoder_output:
+                    imge = encoder_output["backbone_fpn"][-1]
+                else:
+                    imge = encoder_output
+                    
+                se, de = net.sam_prompt_encoder(points=pt, boxes=None, masks=None)
 
-                pred, _ = net.mask_decoder(
+                print("DEBUG: se shape:", se.shape if hasattr(se, 'shape') else type(se))
+                print("DEBUG: de shape:", de.shape if hasattr(de, 'shape') else type(de))
+                print("DEBUG: imge shape:", imge.shape if hasattr(imge, 'shape') else type(imge))
+
+                high_res_features = None
+                if hasattr(net, 'use_high_res_features_in_sam') and net.use_high_res_features_in_sam:
+                    fpn = encoder_output["backbone_fpn"]
+                    high_res_features = [
+                        net.sam_mask_decoder.conv_s0(fpn[0]),
+                        net.sam_mask_decoder.conv_s1(fpn[1]),
+                    ]
+
+                if de is not None and hasattr(de, 'shape'):
+                    if de.shape[-2:] != imge.shape[-2:]:
+                        de = F.interpolate(de, size=imge.shape[-2:], mode='bilinear', align_corners=False)
+                    if de.shape[1] != imge.shape[1]:
+                        if not hasattr(net, 'de_proj') or net.de_proj is None or \
+                           net.de_proj.in_channels != de.shape[1] or net.de_proj.out_channels != imge.shape[1]:
+                            net.de_proj = nn.Conv2d(de.shape[1], imge.shape[1], kernel_size=1).to(de.device)
+                        de = net.de_proj(de)
+
+                pred, iou_pred, sam_tokens_out, object_score_logits = net.sam_mask_decoder(
                     image_embeddings=imge,
-                    image_pe=net.prompt_encoder.get_dense_pe(),
+                    image_pe=net.sam_prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=se,
                     dense_prompt_embeddings=de, 
                     multimask_output=False,
+                    repeat_image=True,
+                    high_res_features=high_res_features,
                 )
                 
+                if pred.shape[-2:] != masks.shape[-2:]:
+                    pred = F.interpolate(pred, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
                 tot += lossfunc(pred, masks)
 
-                '''vis images'''
                 if args.vis:
                     if ind % args.vis == 0:
                         namecat = 'Test'
@@ -196,14 +268,12 @@ def validation_sam(args, val_loader, epoch, net: nn.Module, clean_dir=True):
 
 
 def test_sam(args, val_loader, net: nn.Module):
-    # create output directory
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # eval mode
     net.eval()
 
     mask_type = torch.float32
-    n_val = len(val_loader)  # the number of batch
+    n_val = len(val_loader)
     with tqdm(total=n_val, desc='Validation round', unit='batch', leave=False) as pbar:
         for ind, pack in enumerate(val_loader):
             imgsw = pack['image'].to(dtype = torch.float32).cuda()
@@ -222,28 +292,65 @@ def test_sam(args, val_loader, net: nn.Module):
             showp = pt
             mask_type = torch.float32
 
-            if point_labels[0] != -1:
-                point_coords = pt
-                coords_torch = torch.as_tensor(point_coords, dtype=torch.float).cuda()
-                labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+            if isinstance(pt, tuple) and len(pt) == 2:
+                coords_torch, labels_torch = pt
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+            else:
+                coords_torch = torch.as_tensor(pt, dtype=torch.float).cuda()
+                if coords_torch.shape[-1] == 3:
+                    labels_torch = coords_torch[..., 2].to(torch.int)
+                    coords_torch = coords_torch[..., :2]
+                elif 'point_labels' in locals():
+                    labels_torch = torch.as_tensor(point_labels, dtype=torch.int).cuda()
+                else:
+                    labels_torch = -torch.ones(coords_torch.shape[:-1], dtype=torch.int, device=coords_torch.device)
                 coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
-                pt = (coords_torch, labels_torch)
+            pt = (coords_torch, labels_torch)
 
             imgs = imgs.to(dtype = mask_type).cuda()
-            '''test'''
             with torch.no_grad():
-                imge= net.image_encoder(imgs)
-                se, de = net.prompt_encoder(points=pt, boxes=None, masks=None)
+                encoder_output = net.image_encoder(imgs)
+                
+                if isinstance(encoder_output, dict) and "backbone_fpn" in encoder_output:
+                    imge = encoder_output["backbone_fpn"][-1]
+                else:
+                    imge = encoder_output
+                    
+                se, de = net.sam_prompt_encoder(points=pt, boxes=None, masks=None)
 
-                pred, _ = net.mask_decoder(
+                print("DEBUG: se shape:", se.shape if hasattr(se, 'shape') else type(se))
+                print("DEBUG: de shape:", de.shape if hasattr(de, 'shape') else type(de))
+                print("DEBUG: imge shape:", imge.shape if hasattr(imge, 'shape') else type(imge))
+
+                high_res_features = None
+                if hasattr(net, 'use_high_res_features_in_sam') and net.use_high_res_features_in_sam:
+                    fpn = encoder_output["backbone_fpn"]
+                    high_res_features = [
+                        net.sam_mask_decoder.conv_s0(fpn[0]),
+                        net.sam_mask_decoder.conv_s1(fpn[1]),
+                    ]
+
+                if de is not None and hasattr(de, 'shape'):
+                    if de.shape[-2:] != imge.shape[-2:]:
+                        de = F.interpolate(de, size=imge.shape[-2:], mode='bilinear', align_corners=False)
+                    if de.shape[1] != imge.shape[1]:
+                        if not hasattr(net, 'de_proj') or net.de_proj is None or \
+                           net.de_proj.in_channels != de.shape[1] or net.de_proj.out_channels != imge.shape[1]:
+                            net.de_proj = nn.Conv2d(de.shape[1], imge.shape[1], kernel_size=1).to(de.device)
+                        de = net.de_proj(de)
+
+                pred, iou_pred, sam_tokens_out, object_score_logits = net.sam_mask_decoder(
                     image_embeddings=imge,
-                    image_pe=net.prompt_encoder.get_dense_pe(),
+                    image_pe=net.sam_prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=se,
                     dense_prompt_embeddings=de, 
                     multimask_output=False,
+                    repeat_image=False,
+                    high_res_features=high_res_features,
                 )
 
-            # save images
             orig_size = orig_size.numpy().tolist()[0]
             pred = (F.sigmoid(pred)>0.5).float()
             file_name = pack['mask_path'][0]

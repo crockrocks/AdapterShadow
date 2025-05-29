@@ -1,0 +1,16 @@
+torch
+torchvision
+numpy
+pillow
+opencv-python
+tensorboardX
+matplotlib
+tqdm
+scikit-image
+scikit-learn
+pytorch-lightning
+monai
+kornia
+einops
+python-dateutil
+pathlib
